@@ -166,18 +166,26 @@ class ModelRunner:
         positions = []
         slot_mapping = []
         context_lens = []
+        temperatures = [] if self.rank == 0 else None
+        bs = self.block_size
         for seq in seqs:
+            n = seq.num_tokens
+            bt = seq.block_table
             input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
-            context_lens.append(len(seq))
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+            positions.append(n - 1)
+            context_lens.append(n)
+            slot_mapping.append(bt[-1] * bs + (n - 1) % bs)
+            if temperatures is not None:
+                temperatures.append(seq.temperature)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
-        return input_ids, positions
+        if temperatures is not None:
+            temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+        return input_ids, positions, temperatures
 
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = []
@@ -206,8 +214,11 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        if is_prefill:
+            input_ids, positions = self.prepare_prefill(seqs)
+            temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        else:
+            input_ids, positions, temperatures = self.prepare_decode(seqs)
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
