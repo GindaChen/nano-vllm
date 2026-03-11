@@ -1,5 +1,5 @@
 import atexit
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -10,6 +10,21 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+
+
+@dataclass
+class _CompletionOutput:
+    text: str
+    token_ids: list
+
+
+@dataclass
+class _RequestOutput:
+    text: str
+    token_ids: list
+
+    def __post_init__(self):
+        self.outputs = [_CompletionOutput(self.text, self.token_ids)]
 
 
 class LLMEngine:
@@ -87,7 +102,7 @@ class LLMEngine:
                 if use_tqdm:
                     pbar.update(1)
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        outputs = [_RequestOutput(self.tokenizer.decode(token_ids), token_ids) for token_ids in outputs]
         if use_tqdm:
             pbar.close()
         return outputs
