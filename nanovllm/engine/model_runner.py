@@ -35,6 +35,7 @@ class ModelRunner:
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
+        self._prev_decode_bs = 0
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -135,7 +136,7 @@ class ModelRunner:
         for seq in seqs:
             seqlen = len(seq)
             input_ids.extend(seq[seq.num_cached_tokens:])
-            positions.extend(list(range(seq.num_cached_tokens, seqlen)))
+            positions.extend(range(seq.num_cached_tokens, seqlen))
             seqlen_q = seqlen - seq.num_cached_tokens
             seqlen_k = seqlen
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
@@ -150,7 +151,7 @@ class ModelRunner:
                     end = start + self.block_size
                 else:
                     end = start + seq.last_block_num_tokens 
-                slot_mapping.extend(list(range(start, end)))
+                slot_mapping.extend(range(start, end))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -205,9 +206,15 @@ class ModelRunner:
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
+            prev_bs = self._prev_decode_bs
+            if prev_bs > bs:
+                graph_vars["slot_mapping"][bs:prev_bs].fill_(-1)
+                graph_vars["context_lens"][bs:prev_bs].zero_()
+            elif prev_bs == 0:
+                graph_vars["slot_mapping"].fill_(-1)
+                graph_vars["context_lens"].zero_()
+            self._prev_decode_bs = bs
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
