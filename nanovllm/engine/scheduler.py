@@ -2,7 +2,7 @@ from collections import deque
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
-from nanovllm.engine.block_manager import BlockManager
+from nanovllm.engine.block_manager import SeqSlotManager
 
 
 class Scheduler:
@@ -11,7 +11,7 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        self.block_manager = SeqSlotManager(config.num_kvcache_blocks)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
