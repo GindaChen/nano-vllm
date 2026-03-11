@@ -41,8 +41,12 @@ class Scheduler:
             return scheduled_seqs, True
 
         # decode
-        while self.running and num_seqs < self.max_num_seqs:
-            seq = self.running.popleft()
+        running_list = list(self.running)
+        self.running.clear()
+        for seq in running_list:
+            if num_seqs >= self.max_num_seqs:
+                self.running.append(seq)
+                continue
             while not self.block_manager.can_append(seq):
                 if self.running:
                     self.preempt(self.running.pop())
@@ -54,8 +58,7 @@ class Scheduler:
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
         assert scheduled_seqs
-        self.running.extend(scheduled_seqs)
-        self.running.rotate(len(scheduled_seqs))
+        self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
 
     def preempt(self, seq: Sequence):
