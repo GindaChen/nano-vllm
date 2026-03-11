@@ -197,8 +197,10 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        if is_prefill:
             return self.model.compute_logits(self.model(input_ids, positions))
+        if self.enforce_eager or input_ids.size(0) > 512:
+            return self.model.compute_logits(self.model(input_ids, positions)).argmax(-1)
         else:
             bs = input_ids.size(0)
             context = get_context()
@@ -218,16 +220,18 @@ class ModelRunner:
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+            return graph_vars["token_ids_out"][:bs]
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         if is_prefill:
             input_ids, positions = self.prepare_prefill(seqs)
             temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+            logits = self.run_model(input_ids, positions, is_prefill)
+            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         else:
             input_ids, positions, temperatures = self.prepare_decode(seqs)
-        logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+            token_ids_tensor = self.run_model(input_ids, positions, is_prefill)
+            token_ids = token_ids_tensor.tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
 
@@ -243,6 +247,7 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        token_ids_out = torch.zeros(max_bs, dtype=torch.int64)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 8))
         self.graphs = {}
         self.graph_pool = None
@@ -251,8 +256,10 @@ class ModelRunner:
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+            token_ids_out[:bs] = self.model.compute_logits(outputs[:bs]).argmax(-1)
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+                token_ids_out[:bs] = self.model.compute_logits(outputs[:bs]).argmax(-1)
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph
@@ -266,4 +273,5 @@ class ModelRunner:
             context_lens=context_lens,
             block_tables=block_tables,
             outputs=outputs,
+            token_ids_out=token_ids_out,
         )
