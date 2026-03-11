@@ -40,9 +40,18 @@ class Scheduler:
         if scheduled_seqs:
             return scheduled_seqs, True
 
-        # decode
-        while self.running and num_seqs < self.max_num_seqs:
-            seq = self.running.popleft()
+        # decode - prioritize sequences closer to completion for better batching
+        running_list = list(self.running)
+        self.running.clear()
+        
+        # Sort by estimated remaining tokens (ascending - shortest first)
+        running_list.sort(key=lambda seq: seq.max_tokens - seq.num_completion_tokens)
+        
+        for seq in running_list:
+            if num_seqs >= self.max_num_seqs:
+                self.running.append(seq)
+                continue
+                
             while not self.block_manager.can_append(seq):
                 if self.running:
                     self.preempt(self.running.pop())
@@ -53,9 +62,12 @@ class Scheduler:
                 num_seqs += 1
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
+        
         assert scheduled_seqs
-        self.running.extend(scheduled_seqs)
-        self.running.rotate(len(scheduled_seqs))
+        # Add remaining unscheduled sequences back to running queue
+        for seq in running_list[len(scheduled_seqs):]:
+            if seq not in scheduled_seqs:
+                self.running.append(seq)
         return scheduled_seqs, False
 
     def preempt(self, seq: Sequence):
