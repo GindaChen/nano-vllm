@@ -84,7 +84,8 @@ class Attention(nn.Module):
                                                 cache_seqlens=context.context_lens,
                                                 page_table=context.block_tables,
                                                 k_descale=_kv_ones, v_descale=_kv_ones,
-                                                softmax_scale=self.scale, causal=True).squeeze(1)
+                                                softmax_scale=self.scale, causal=True,
+                                                num_splits=1).squeeze(1)
             else:
                 o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
                                             cache_seqlens=context.context_lens,
