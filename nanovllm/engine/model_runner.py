@@ -164,23 +164,21 @@ class ModelRunner:
 
     def prepare_decode(self, seqs: list[Sequence]):
         input_ids = []
-        slot_mapping = []
         context_lens = []
         temperatures = [] if self.rank == 0 else None
-        bs = self.block_size
         for seq in seqs:
-            n = seq.num_tokens
-            bt = seq.block_table
             input_ids.append(seq.last_token)
-            context_lens.append(n)
-            slot_mapping.append(bt[-1] * bs + (n - 1) % bs)
+            context_lens.append(seq.num_tokens)
             if temperatures is not None:
                 temperatures.append(seq.temperature)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         positions = context_lens.long() - 1
         block_tables = self.prepare_block_tables(seqs)
+        # derive slot_mapping on GPU: last_block_id * block_size + position_within_block
+        block_idx = positions // self.block_size
+        last_block = block_tables.gather(1, block_idx.unsqueeze(1)).squeeze(1)
+        slot_mapping = (last_block * self.block_size + positions % self.block_size).to(torch.int32)
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         if temperatures is not None:
             temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
