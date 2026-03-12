@@ -77,11 +77,13 @@ class Attention(nn.Module):
         else:    # decode
             if _FA3_AVAILABLE and k_cache.dtype == torch.float8_e4m3fn:
                 # FP8 paged KV decode: cast Q to FP8 to match K,V dtype (FA3 requires all same dtype)
-                _one = k_cache.new_ones(1, dtype=torch.float32)
+                # k_descale/v_descale: shape (batch_size, num_kv_heads) — all 1.0 (no re-scaling)
+                bs = q.shape[0]
+                _kv_ones = k_cache.new_ones(bs, self.num_kv_heads, dtype=torch.float32)
                 o = fa3_flash_attn_with_kvcache(q.unsqueeze(1).to(torch.float8_e4m3fn), k_cache, v_cache,
                                                 cache_seqlens=context.context_lens,
                                                 page_table=context.block_tables,
-                                                k_descale=_one, v_descale=_one,
+                                                k_descale=_kv_ones, v_descale=_kv_ones,
                                                 softmax_scale=self.scale, causal=True).squeeze(1)
             else:
                 o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
