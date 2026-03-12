@@ -163,31 +163,40 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
+        n_seqs = len(seqs)
         input_ids = []
-        positions = []
-        slot_mapping = []
         context_lens = []
-        bs = self.block_size
+        max_bt_len = 0
         for seq in seqs:
-            n = seq.num_tokens
-            bt = seq.block_table
             input_ids.append(seq.last_token)
-            positions.append(n - 1)
-            context_lens.append(n)
-            slot_mapping.append(bt[-1] * bs + (n - 1) % bs)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
-        return input_ids, positions
+            context_lens.append(seq.num_tokens)
+            bt_len = len(seq.block_table)
+            if bt_len > max_bt_len:
+                max_bt_len = bt_len
+        flat_bt = []
+        for seq in seqs:
+            bt = seq.block_table
+            flat_bt.extend(bt)
+            flat_bt.extend((-1,) * (max_bt_len - len(bt)))
+        input_ids_gpu = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        context_lens_gpu = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables_gpu = torch.tensor(flat_bt, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True).view(n_seqs, max_bt_len)
+        # slot_mapping and positions are derived inside the CUDA graph (zero allocation overhead)
+        set_context(False, slot_mapping=None, context_lens=context_lens_gpu, block_tables=block_tables_gpu)
+        return input_ids_gpu
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor | None, is_prefill: bool):
         if is_prefill:
             return self.model.compute_logits(self.model(input_ids, positions))
         if self.enforce_eager or input_ids.size(0) > self.graph_bs[-1]:
+            context = get_context()
+            ctx = context.context_lens
+            safe_ctx = ctx.clamp(min=1)
+            page_idx = ((safe_ctx.long() - 1) // self.block_size).unsqueeze(1)
+            page_block_id = context.block_tables.gather(1, page_idx).squeeze(1)
+            context.slot_mapping = torch.where(ctx > 0, page_block_id * self.block_size + (safe_ctx - 1) % self.block_size, torch.full_like(page_block_id, -1))
+            positions = (safe_ctx - 1).long()
             return self.model.compute_logits(self.model(input_ids, positions)).argmax(-1)
         else:
             bs = input_ids.size(0)
@@ -196,16 +205,12 @@ class ModelRunner:
             graph = self.graphs[bucket_bs]
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
             prev_bs = self._prev_decode_bs
             if prev_bs > bs:
-                graph_vars["slot_mapping"][bs:prev_bs].fill_(-1)
                 graph_vars["context_lens"][bs:prev_bs].zero_()
             elif prev_bs == 0:
-                graph_vars["slot_mapping"].fill_(-1)
                 graph_vars["context_lens"].zero_()
             self._prev_decode_bs = bs
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
@@ -220,8 +225,8 @@ class ModelRunner:
             else:
                 token_ids = None
         else:
-            input_ids, positions = self.prepare_decode(seqs)
-            token_ids_tensor = self.run_model(input_ids, positions, is_prefill)
+            input_ids = self.prepare_decode(seqs)
+            token_ids_tensor = self.run_model(input_ids, None, is_prefill)
             token_ids = token_ids_tensor.tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
@@ -232,11 +237,13 @@ class ModelRunner:
         hf_config = config.hf_config
         max_bs = self.config.max_num_seqs
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        block_size = self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
+        slot_mapping = torch.full((max_bs,), -1, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+        neg_ones = torch.full((max_bs,), -1, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
         token_ids_out = torch.zeros(max_bs, dtype=torch.int64)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 8))
@@ -247,10 +254,21 @@ class ModelRunner:
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs],
                         block_tables=block_tables[:bs])
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+            # warmup — slot_mapping and positions derived from context_lens + block_tables
+            ctx = context_lens[:bs]
+            safe_ctx = ctx.clamp(min=1)
+            page_idx = ((safe_ctx.long() - 1) // block_size).unsqueeze(1)
+            torch.where(ctx > 0, block_tables[:bs].gather(1, page_idx).squeeze(1) * block_size + (safe_ctx - 1) % block_size, neg_ones[:bs], out=slot_mapping[:bs])
+            positions[:bs].copy_((safe_ctx - 1).long())
+            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
             token_ids_out[:bs] = self.model.compute_logits(outputs[:bs]).argmax(-1)
             with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+                ctx = context_lens[:bs]
+                safe_ctx = ctx.clamp(min=1)
+                page_idx = ((safe_ctx.long() - 1) // block_size).unsqueeze(1)
+                torch.where(ctx > 0, block_tables[:bs].gather(1, page_idx).squeeze(1) * block_size + (safe_ctx - 1) % block_size, neg_ones[:bs], out=slot_mapping[:bs])
+                positions[:bs].copy_((safe_ctx - 1).long())
+                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
                 token_ids_out[:bs] = self.model.compute_logits(outputs[:bs]).argmax(-1)
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
@@ -264,6 +282,7 @@ class ModelRunner:
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             block_tables=block_tables,
+            neg_ones=neg_ones,
             outputs=outputs,
             token_ids_out=token_ids_out,
         )
