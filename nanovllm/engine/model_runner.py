@@ -1,4 +1,5 @@
 import pickle
+import numpy as np
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -38,6 +39,7 @@ class ModelRunner:
         self._prev_decode_bs = 0
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
+        self._init_decode_buffers()
 
         if self.world_size > 1:
             if rank == 0:
@@ -118,11 +120,34 @@ class ModelRunner:
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
 
+    def _init_decode_buffers(self):
+        max_bs = self.config.max_num_seqs
+        max_num_blocks = (self.config.max_model_len + self.block_size - 1) // self.block_size
+        self._pin_input_ids = torch.empty(max_bs, dtype=torch.int64).pin_memory()
+        self._pin_positions = torch.empty(max_bs, dtype=torch.int64).pin_memory()
+        self._pin_slot_mapping = torch.empty(max_bs, dtype=torch.int32).pin_memory()
+        self._pin_context_lens = torch.empty(max_bs, dtype=torch.int32).pin_memory()
+        self._pin_block_tables = torch.full((max_bs, max_num_blocks), -1, dtype=torch.int32).pin_memory()
+        self._np_input_ids = self._pin_input_ids.numpy()
+        self._np_positions = self._pin_positions.numpy()
+        self._np_slot_mapping = self._pin_slot_mapping.numpy()
+        self._np_context_lens = self._pin_context_lens.numpy()
+        self._np_block_tables = self._pin_block_tables.numpy()
+
     def prepare_block_tables(self, seqs: list[Sequence]):
-        max_len = max(len(seq.block_table) for seq in seqs)
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
-        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        return block_tables
+        np_bt = self._np_block_tables
+        max_bt_len = 0
+        for i, seq in enumerate(seqs):
+            lbt = len(seq.block_table)
+            if lbt > max_bt_len:
+                max_bt_len = lbt
+        for i, seq in enumerate(seqs):
+            bt = seq.block_table
+            lbt = len(bt)
+            np_bt[i, :lbt] = bt
+            if lbt < max_bt_len:
+                np_bt[i, lbt:max_bt_len] = -1
+        return self._pin_block_tables[:len(seqs), :max_bt_len].cuda(non_blocking=True)
 
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
@@ -163,25 +188,26 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
-        input_ids = []
-        positions = []
-        slot_mapping = []
-        context_lens = []
+        n_seqs = len(seqs)
+        bsz = self.block_size
+        np_ii = self._np_input_ids
+        np_pos = self._np_positions
+        np_sm = self._np_slot_mapping
+        np_cl = self._np_context_lens
         temperatures = [] if self.rank == 0 else None
-        bs = self.block_size
-        for seq in seqs:
+        for i, seq in enumerate(seqs):
             n = seq.num_tokens
             bt = seq.block_table
-            input_ids.append(seq.last_token)
-            positions.append(n - 1)
-            context_lens.append(n)
-            slot_mapping.append(bt[-1] * bs + (n - 1) % bs)
+            np_ii[i] = seq.last_token
+            np_pos[i] = n - 1
+            np_cl[i] = n
+            np_sm[i] = bt[-1] * bsz + (n - 1) % bsz
             if temperatures is not None:
                 temperatures.append(seq.temperature)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        input_ids = self._pin_input_ids[:n_seqs].cuda(non_blocking=True)
+        positions = self._pin_positions[:n_seqs].cuda(non_blocking=True)
+        slot_mapping = self._pin_slot_mapping[:n_seqs].cuda(non_blocking=True)
+        context_lens = self._pin_context_lens[:n_seqs].cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         if temperatures is not None:
