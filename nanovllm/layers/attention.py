@@ -73,5 +73,5 @@ class Attention(nn.Module):
                                         cache_seqlens=context.context_lens,
                                         block_table=context.block_tables,
                                         softmax_scale=self.scale, causal=True,
-                                        num_splits=2).squeeze(1)
+                                        num_splits=4).squeeze(1)
         return o
