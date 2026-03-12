@@ -267,12 +267,22 @@ class ModelRunner:
         indptr_buf = self.fi_indptrs[bucket]
         indices_buf = self.fi_indices[bucket]
         lpl_buf = self.fi_last_page_lens[bucket]
-        num_pages = self._fi_indptr[-1]
+        actual_pages = self._fi_indptr[-1]
         indptr_buf[:bs + 1].copy_(torch.tensor(self._fi_indptr, dtype=torch.int32))
-        indices_buf[:num_pages].copy_(torch.tensor(self._fi_indices, dtype=torch.int32))
+        indices_buf[:actual_pages].copy_(torch.tensor(self._fi_indices, dtype=torch.int32))
         lpl_buf[:bs].copy_(torch.tensor(self._fi_last_page_len, dtype=torch.int32))
+        # FlashInfer cudagraph mode requires batch_size == bucket: pad dummy slots
+        if bs < bucket:
+            dummy_count = bucket - bs
+            ext = torch.arange(actual_pages + 1, actual_pages + dummy_count + 1, dtype=torch.int32)
+            indptr_buf[bs + 1:bucket + 1].copy_(ext)
+            indices_buf[actual_pages:actual_pages + dummy_count].zero_()
+            lpl_buf[bs:bucket].fill_(self.fi_page_size)
+            total_pages = actual_pages + dummy_count
+        else:
+            total_pages = actual_pages
         wrapper.plan(
-            indptr_buf[:bs + 1], indices_buf[:num_pages], lpl_buf[:bs],
+            indptr_buf[:bucket + 1], indices_buf[:total_pages], lpl_buf[:bucket],
             self.fi_num_qo_heads, self.fi_num_kv_heads, self.fi_head_dim,
             self.fi_page_size, q_data_type=q_dtype,
         )
