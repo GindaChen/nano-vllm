@@ -169,7 +169,6 @@ class ModelRunner:
         positions = []
         slot_mapping = []
         context_lens = []
-        temperatures = [] if self.rank == 0 else None
         bs = self.block_size
         for seq in seqs:
             n = seq.num_tokens
@@ -178,17 +177,13 @@ class ModelRunner:
             positions.append(n - 1)
             context_lens.append(n)
             slot_mapping.append(bt[-1] * bs + (n - 1) % bs)
-            if temperatures is not None:
-                temperatures.append(seq.temperature)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
-        if temperatures is not None:
-            temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
-        return input_ids, positions, temperatures
+        return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = []
@@ -236,7 +231,7 @@ class ModelRunner:
             else:
                 token_ids = None
         else:
-            input_ids, positions, temperatures = self.prepare_decode(seqs)
+            input_ids, positions = self.prepare_decode(seqs)
             token_ids_tensor = self.run_model(input_ids, positions, is_prefill)
             token_ids = token_ids_tensor.tolist() if self.rank == 0 else None
         reset_context()
