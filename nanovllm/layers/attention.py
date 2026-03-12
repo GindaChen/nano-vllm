@@ -4,11 +4,6 @@ import triton
 import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-try:
-    from flash_attn_3.flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func_fa3
-    _HAS_FA3 = True
-except ImportError:
-    _HAS_FA3 = False
 from nanovllm.utils.context import get_context
 
 
@@ -69,16 +64,10 @@ class Attention(nn.Module):
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
-            if _HAS_FA3 and context.block_tables is None:
-                o = flash_attn_varlen_func_fa3(q, k, v,
-                                               max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-                                               max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                               softmax_scale=self.scale, causal=True)
-            else:
-                o = flash_attn_varlen_func(q, k, v,
-                                           max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-                                           max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                           softmax_scale=self.scale, causal=True, block_table=context.block_tables)
+            o = flash_attn_varlen_func(q, k, v,
+                                       max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
+                                       max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
+                                       softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode
             o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
                                         cache_seqlens=context.context_lens,
