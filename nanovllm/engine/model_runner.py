@@ -1,8 +1,6 @@
 import pickle
 import torch
 import torch.distributed as dist
-import triton
-import triton.language as tl
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
@@ -12,31 +10,6 @@ from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
-
-
-@triton.jit
-def _decode_update_kernel(
-    input_ids_ptr, token_ids_out_ptr,
-    positions_ptr, context_lens_ptr,
-    slot_mapping_ptr, block_tables_ptr,
-    block_tables_stride,
-    block_size: tl.constexpr,
-    bs,
-):
-    idx = tl.program_id(0)
-    if idx >= bs:
-        return
-    tok = tl.load(token_ids_out_ptr + idx)
-    tl.store(input_ids_ptr + idx, tok)
-    cl = tl.load(context_lens_ptr + idx)
-    new_cl = cl + 1
-    tl.store(context_lens_ptr + idx, new_cl)
-    tl.store(positions_ptr + idx, cl.to(tl.int64))
-    block_idx = (new_cl - 1) // block_size
-    offset = (new_cl - 1) % block_size
-    bt_val = tl.load(block_tables_ptr + idx * block_tables_stride + block_idx)
-    slot = bt_val * block_size + offset
-    tl.store(slot_mapping_ptr + idx, slot)
 
 
 class ModelRunner:
@@ -202,7 +175,7 @@ class ModelRunner:
             input_ids.append(seq.last_token)
             positions.append(n - 1)
             context_lens.append(n)
-            slot_mapping.append(bt[(n - 1) // bs] * bs + (n - 1) % bs)
+            slot_mapping.append(bt[-1] * bs + (n - 1) % bs)
             if temperatures is not None:
                 temperatures.append(seq.temperature)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -223,11 +196,11 @@ class ModelRunner:
         return temperatures
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool, k: int = 1):
+    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill:
             return self.model.compute_logits(self.model(input_ids, positions))
         if self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions)).argmax(-1).unsqueeze(0)
+            return self.model.compute_logits(self.model(input_ids, positions)).argmax(-1)
         else:
             bs = input_ids.size(0)
             context = get_context()
@@ -246,40 +219,25 @@ class ModelRunner:
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            if k == 1:
-                graph.replay()
-                return graph_vars["token_ids_out"][:bs].unsqueeze(0)
-            bt_stride = graph_vars["block_tables"].shape[1]
-            all_outputs = torch.empty(k, bs, dtype=torch.int64)
-            for j in range(k):
-                graph.replay()
-                all_outputs[j] = graph_vars["token_ids_out"][:bs]
-                if j < k - 1:
-                    _decode_update_kernel[(bs,)](
-                        graph_vars["input_ids"], graph_vars["token_ids_out"],
-                        graph_vars["positions"], graph_vars["context_lens"],
-                        graph_vars["slot_mapping"], graph_vars["block_tables"],
-                        block_tables_stride=bt_stride,
-                        block_size=self.block_size,
-                        bs=bs,
-                    )
-            return all_outputs
+            graph.replay()
+            return graph_vars["token_ids_out"][:bs]
 
-    def run(self, seqs: list[Sequence], is_prefill: bool, k: int = 1) -> list[list[int]]:
+    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         if is_prefill:
             input_ids, positions = self.prepare_prefill(seqs)
             temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
             logits = self.run_model(input_ids, positions, is_prefill)
             # logits shape: [num_seqs, vocab_size] — ParallelLMHead already extracts last-position tokens
-            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-            reset_context()
-            return [token_ids]
+            if self.rank == 0:
+                token_ids = self.sampler(logits, temperatures).tolist()
+            else:
+                token_ids = None
         else:
             input_ids, positions, temperatures = self.prepare_decode(seqs)
-            all_token_ids_tensor = self.run_model(input_ids, positions, is_prefill, k)  # [k, bs]
-            all_token_ids = all_token_ids_tensor.tolist() if self.rank == 0 else [None] * k
-            reset_context()
-            return all_token_ids
+            token_ids_tensor = self.run_model(input_ids, positions, is_prefill)
+            token_ids = token_ids_tensor.tolist() if self.rank == 0 else None
+        reset_context()
+        return token_ids
 
     @torch.inference_mode()
     def capture_cudagraph(self):
@@ -321,12 +279,3 @@ class ModelRunner:
             outputs=outputs,
             token_ids_out=token_ids_out,
         )
-        # Pre-warm _decode_update_kernel to trigger Triton JIT before benchmark timing
-        _decode_update_kernel[(max_bs,)](
-            input_ids, token_ids_out, positions, context_lens,
-            slot_mapping, block_tables,
-            block_tables_stride=max_num_blocks,
-            block_size=self.block_size,
-            bs=max_bs,
-        )
-        torch.cuda.synchronize()
