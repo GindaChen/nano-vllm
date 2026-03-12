@@ -60,10 +60,7 @@ class Attention(nn.Module):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
-            if k_cache.dtype == torch.float8_e4m3fn:
-                store_kvcache(k.to(torch.float8_e4m3fn), v.to(torch.float8_e4m3fn), k_cache, v_cache, context.slot_mapping)
-            else:
-                store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache.to(k.dtype), v_cache.to(v.dtype)
@@ -72,12 +69,8 @@ class Attention(nn.Module):
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode
-            fi_wrapper = context.flashinfer_decode_wrapper
-            if fi_wrapper is not None:
-                o = fi_wrapper.run(q, (k_cache, v_cache), sm_scale=self.scale)
-            else:
-                o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                            cache_seqlens=context.context_lens,
-                                            block_table=context.block_tables,
-                                            softmax_scale=self.scale, causal=True).squeeze(1)
+            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
+                                        cache_seqlens=context.context_lens,
+                                        block_table=context.block_tables,
+                                        softmax_scale=self.scale, causal=True).squeeze(1)
         return o
