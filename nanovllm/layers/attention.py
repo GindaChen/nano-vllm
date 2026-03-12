@@ -6,6 +6,12 @@ import triton.language as tl
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
 
+try:
+    from flash_attn_3.flash_attn_interface import flash_attn_with_kvcache as fa3_flash_attn_with_kvcache
+    _FA3_AVAILABLE = True
+except ImportError:
+    _FA3_AVAILABLE = False
+
 
 @triton.jit
 def store_kvcache_kernel(
@@ -26,8 +32,8 @@ def store_kvcache_kernel(
     key = tl.load(key_ptr + key_offsets)
     value = tl.load(value_ptr + value_offsets)
     cache_offsets = slot * D + tl.arange(0, D)
-    tl.store(k_cache_ptr + cache_offsets, key)
-    tl.store(v_cache_ptr + cache_offsets, value)
+    tl.store(k_cache_ptr + cache_offsets, key.to(tl.float8e4nv))
+    tl.store(v_cache_ptr + cache_offsets, value.to(tl.float8e4nv))
 
 
 def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
@@ -69,8 +75,17 @@ class Attention(nn.Module):
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode
-            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens,
-                                        block_table=context.block_tables,
-                                        softmax_scale=self.scale, causal=True).squeeze(1)
+            if _FA3_AVAILABLE and k_cache.dtype == torch.float8_e4m3fn:
+                # FP8 paged KV decode: cast Q to FP8 to match K,V dtype (FA3 requires all same dtype)
+                _one = k_cache.new_ones(1, dtype=torch.float32)
+                o = fa3_flash_attn_with_kvcache(q.unsqueeze(1).to(torch.float8_e4m3fn), k_cache, v_cache,
+                                                cache_seqlens=context.context_lens,
+                                                page_table=context.block_tables,
+                                                k_descale=_one, v_descale=_one,
+                                                softmax_scale=self.scale, causal=True).squeeze(1)
+            else:
+                o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
+                                            cache_seqlens=context.context_lens,
+                                            block_table=context.block_tables,
+                                            softmax_scale=self.scale, causal=True).squeeze(1)
         return o
