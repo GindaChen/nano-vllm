@@ -71,7 +71,7 @@ class Attention(nn.Module):
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode
             if context.fi_wrapper is not None:
-                o = context.fi_wrapper.run(q, k_cache, v_cache)
+                o = context.fi_wrapper.run(q, (k_cache, v_cache))
             else:
                 o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
                                             cache_seqlens=context.context_lens, block_table=context.block_tables,
