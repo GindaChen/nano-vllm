@@ -107,8 +107,13 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        kv_dtype = torch.float8_e4m3fn
-        kv_dtype_bytes = 1  # FP8 = 1 byte per element
+        try:
+            import flashinfer  # noqa: F401
+            kv_dtype = torch.float8_e4m3fn
+            kv_dtype_bytes = 1  # FP8 = 1 byte per element
+        except Exception:
+            kv_dtype = hf_config.torch_dtype
+            kv_dtype_bytes = hf_config.torch_dtype.itemsize
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * kv_dtype_bytes
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
