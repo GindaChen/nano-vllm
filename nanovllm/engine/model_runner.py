@@ -8,7 +8,6 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
-from nanovllm.layers.attention import Attention
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
@@ -111,13 +110,12 @@ class ModelRunner:
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
-        # Interleaved KV layout [L, B, 2, S, H, D] for FlashInfer NHD
-        # kv_cache[l] shape [B, 2, S, H, D]: kv_cache[l, :, 0] = K, kv_cache[l, :, 1] = V
-        self.kv_cache = torch.empty(hf_config.num_hidden_layers, config.num_kvcache_blocks, 2, self.block_size, num_kv_heads, head_dim)
+        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
-            if isinstance(module, Attention):
-                module.kv_cache = self.kv_cache[layer_id]
+            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                module.k_cache = self.kv_cache[0, layer_id]
+                module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
@@ -152,7 +150,7 @@ class ModelRunner:
                 if i != seq.num_blocks - 1:
                     end = start + self.block_size
                 else:
-                    end = start + seq.last_block_num_tokens
+                    end = start + seq.last_block_num_tokens 
                 slot_mapping.extend(range(start, end))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
@@ -168,9 +166,7 @@ class ModelRunner:
         input_ids = []
         positions = []
         slot_mapping = []
-        fi_kv_indptr = [0]
-        fi_kv_indices = []
-        fi_kv_last_page_len = []
+        context_lens = []
         temperatures = [] if self.rank == 0 else None
         bs = self.block_size
         for seq in seqs:
@@ -178,22 +174,16 @@ class ModelRunner:
             bt = seq.block_table
             input_ids.append(seq.last_token)
             positions.append(n - 1)
+            context_lens.append(n)
             slot_mapping.append(bt[-1] * bs + (n - 1) % bs)
-            fi_kv_indptr.append(fi_kv_indptr[-1] + len(bt))
-            fi_kv_indices.extend(bt)
-            fi_kv_last_page_len.append((n - 1) % bs + 1)
             if temperatures is not None:
                 temperatures.append(seq.temperature)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        fi_total_pages = fi_kv_indptr[-1]
-        fi_kv_indptr = torch.tensor(fi_kv_indptr, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        fi_kv_indices = torch.tensor(fi_kv_indices, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        fi_kv_last_page_len = torch.tensor(fi_kv_last_page_len, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(False, slot_mapping=slot_mapping,
-                    fi_kv_indptr=fi_kv_indptr, fi_kv_indices=fi_kv_indices,
-                    fi_kv_last_page_len=fi_kv_last_page_len, fi_total_pages=fi_total_pages)
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables(seqs)
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         if temperatures is not None:
             temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return input_ids, positions, temperatures
@@ -214,38 +204,21 @@ class ModelRunner:
         else:
             bs = input_ids.size(0)
             context = get_context()
-            bucket = next(x for x in self.graph_bs if x >= bs)
-            graph = self.graphs[bucket]
+            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
             prev_bs = self._prev_decode_bs
             if prev_bs > bs:
                 graph_vars["slot_mapping"][bs:prev_bs].fill_(-1)
+                graph_vars["context_lens"][bs:prev_bs].zero_()
             elif prev_bs == 0:
                 graph_vars["slot_mapping"].fill_(-1)
+                graph_vars["context_lens"].zero_()
             self._prev_decode_bs = bs
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            # Update FlashInfer static buffers for this bucket's wrapper and re-plan
-            fi_total = context.fi_total_pages
-            fi_buf = self.fi_bufs[bucket]
-            fi_buf["indptr"][:bs + 1].copy_(context.fi_kv_indptr, non_blocking=True)
-            fi_buf["indices"][:fi_total].copy_(context.fi_kv_indices, non_blocking=True)
-            fi_buf["last_page_len"][:bs].copy_(context.fi_kv_last_page_len, non_blocking=True)
-            # Extra slots beyond bs: zero pages (bucket - bs extra dummy seqs in the graph)
-            if bs < bucket:
-                fi_buf["indptr"][bs + 1:bucket + 1].fill_(fi_total)
-                fi_buf["last_page_len"][bs:bucket].fill_(1)
-            self.fi_wrappers[bucket].begin_forward(
-                fi_buf["indptr"],
-                fi_buf["indices"],
-                fi_buf["last_page_len"],
-                self._fi_num_qo_heads,
-                self._fi_num_kv_heads,
-                self._fi_head_dim,
-                self.block_size,
-                self.config.hf_config.torch_dtype,
-            )
+            graph_vars["context_lens"][:bs] = context.context_lens
+            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
             return graph_vars["token_ids_out"][:bs]
 
@@ -264,79 +237,26 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_cudagraph(self):
-        import flashinfer
         config = self.config
         hf_config = config.hf_config
-        max_bs = min(config.max_num_seqs, 512)
+        max_bs = min(self.config.max_num_seqs, 512)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
-        max_total_pages = max_bs * max_num_blocks
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        num_qo_heads = hf_config.num_attention_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        self._fi_num_qo_heads = num_qo_heads
-        self._fi_num_kv_heads = num_kv_heads
-        self._fi_head_dim = head_dim
-
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 8))
-
-        # Shared workspace for all FlashInfer wrappers (one active at a time)
-        fi_workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8)
-
-        # Per-bucket FlashInfer wrappers + static buffers
-        self.fi_wrappers = {}
-        self.fi_bufs = {}
-        for bs in self.graph_bs:
-            fi_indptr = torch.zeros(bs + 1, dtype=torch.int32)
-            fi_indices = torch.zeros(max_total_pages, dtype=torch.int32)
-            fi_last_page_len = torch.ones(bs, dtype=torch.int32)
-            wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-                fi_workspace, "NHD",
-                use_cuda_graph=True,
-                paged_kv_indptr_buffer=fi_indptr,
-                paged_kv_indices_buffer=fi_indices,
-                paged_kv_last_page_len_buffer=fi_last_page_len,
-            )
-            self.fi_wrappers[bs] = wrapper
-            self.fi_bufs[bs] = dict(indptr=fi_indptr, indices=fi_indices, last_page_len=fi_last_page_len)
-
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.full((max_bs,), -1, dtype=torch.int32)
+        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
+        context_lens = torch.zeros(max_bs, dtype=torch.int32)
+        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
         token_ids_out = torch.zeros(max_bs, dtype=torch.int64)
+        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 8))
         self.graphs = {}
         self.graph_pool = None
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
-            wrapper = self.fi_wrappers[bs]
-            fi_buf = self.fi_bufs[bs]
-
-            # Dummy FlashInfer inputs: each seq has max_num_blocks pages
-            dummy_pages = bs * max_num_blocks
-            fi_buf["indptr"][:] = torch.arange(0, bs + 1, dtype=torch.int32) * max_num_blocks
-            fi_buf["indices"][:dummy_pages] = torch.arange(dummy_pages, dtype=torch.int32)
-            fi_buf["last_page_len"][:] = self.block_size
-
-            # Set this bucket's wrapper on all attention modules, then warmup
-            for module in self.model.modules():
-                if isinstance(module, Attention):
-                    module.decode_wrapper = wrapper
-
-            wrapper.begin_forward(
-                fi_buf["indptr"], fi_buf["indices"][:dummy_pages], fi_buf["last_page_len"],
-                num_qo_heads, num_kv_heads, head_dim, self.block_size, hf_config.torch_dtype,
-            )
-            set_context(False, slot_mapping=slot_mapping[:bs])
+            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
             token_ids_out[:bs] = self.model.compute_logits(outputs[:bs]).argmax(-1)
-
-            # Re-plan before capture (same dummy inputs)
-            wrapper.begin_forward(
-                fi_buf["indptr"], fi_buf["indices"][:dummy_pages], fi_buf["last_page_len"],
-                num_qo_heads, num_kv_heads, head_dim, self.block_size, hf_config.torch_dtype,
-            )
-            set_context(False, slot_mapping=slot_mapping[:bs])
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
                 token_ids_out[:bs] = self.model.compute_logits(outputs[:bs]).argmax(-1)
@@ -350,6 +270,8 @@ class ModelRunner:
             input_ids=input_ids,
             positions=positions,
             slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
             outputs=outputs,
             token_ids_out=token_ids_out,
         )
