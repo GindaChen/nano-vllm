@@ -6,11 +6,21 @@ import triton.language as tl
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
 
+_FA3_AVAILABLE = False
+fa3_flash_attn_with_kvcache = None
+_fa3_info = "not tried"
 try:
-    from flash_attn_3.flash_attn_interface import flash_attn_with_kvcache as fa3_flash_attn_with_kvcache
-    _FA3_AVAILABLE = True
-except ImportError:
-    _FA3_AVAILABLE = False
+    try:
+        from flash_attn_3 import flash_attn_with_kvcache as fa3_flash_attn_with_kvcache
+        _FA3_AVAILABLE = True
+        _fa3_info = "flash_attn_3 top-level"
+    except (ImportError, AttributeError):
+        from flash_attn_3.flash_attn_interface import flash_attn_with_kvcache as fa3_flash_attn_with_kvcache
+        _FA3_AVAILABLE = True
+        _fa3_info = "flash_attn_3.flash_attn_interface"
+except Exception as _fa3_exc:
+    _fa3_info = f"unavailable: {_fa3_exc}"
+print(f"[nanovllm] FA3 status: {_fa3_info}", flush=True)
 
 
 @triton.jit
