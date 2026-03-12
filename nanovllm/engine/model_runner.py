@@ -321,3 +321,12 @@ class ModelRunner:
             outputs=outputs,
             token_ids_out=token_ids_out,
         )
+        # Pre-warm _decode_update_kernel to trigger Triton JIT before benchmark timing
+        _decode_update_kernel[(max_bs,)](
+            input_ids, token_ids_out, positions, context_lens,
+            slot_mapping, block_tables,
+            block_tables_stride=max_num_blocks,
+            block_size=self.block_size,
+            bs=max_bs,
+        )
+        torch.cuda.synchronize()
