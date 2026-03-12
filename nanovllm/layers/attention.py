@@ -32,9 +32,8 @@ def store_kvcache_kernel(
     key = tl.load(key_ptr + key_offsets)
     value = tl.load(value_ptr + value_offsets)
     cache_offsets = slot * D + tl.arange(0, D)
-    # Cast bf16 → fp8_e4m3fn (1 byte each); values in [-448, 448] encode losslessly
-    tl.store(k_cache_ptr + cache_offsets, key.to(tl.float8e4nv))
-    tl.store(v_cache_ptr + cache_offsets, value.to(tl.float8e4nv))
+    tl.store(k_cache_ptr + cache_offsets, key)
+    tl.store(v_cache_ptr + cache_offsets, value)
 
 
 def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
@@ -77,13 +76,11 @@ class Attention(nn.Module):
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode
             if _FA3_AVAILABLE:
-                # k_descale/v_descale=1.0: KV stored as fp8 with no scaling (range ±448 covers ±5σ)
-                _one = k_cache.new_ones(1, dtype=torch.float32)
                 o = fa3_flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
                                                 cache_seqlens=context.context_lens,
                                                 page_table=context.block_tables,
-                                                k_descale=_one, v_descale=_one,
-                                                softmax_scale=self.scale, causal=True).squeeze(1)
+                                                softmax_scale=self.scale, causal=True,
+                                                pack_gqa=True).squeeze(1)
             else:
                 o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
                                             cache_seqlens=context.context_lens,
