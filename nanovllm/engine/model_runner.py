@@ -187,7 +187,7 @@ class ModelRunner:
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill:
             return self.model.compute_logits(self.model(input_ids, positions))
-        if self.enforce_eager or input_ids.size(0) > 512:
+        if self.enforce_eager or input_ids.size(0) > self.graph_bs[-1]:
             return self.model.compute_logits(self.model(input_ids, positions)).argmax(-1)
         else:
             bs = input_ids.size(0)
@@ -230,7 +230,7 @@ class ModelRunner:
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
-        max_bs = min(self.config.max_num_seqs, 512)
+        max_bs = self.config.max_num_seqs
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
