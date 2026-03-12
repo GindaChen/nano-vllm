@@ -307,17 +307,15 @@ class ModelRunner:
         self.graphs = {}
         self.graph_pool = None
 
-        num_kvcache_blocks = config.num_kvcache_blocks
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             wrapper = self.fi_wrappers[bs]
             fi_buf = self.fi_bufs[bs]
 
-            # Dummy FlashInfer inputs: cap indices to valid kv_cache range
-            dummy_blocks_per_seq = max(1, num_kvcache_blocks // bs)
-            dummy_pages = bs * dummy_blocks_per_seq
-            fi_buf["indptr"][:] = torch.arange(0, bs + 1, dtype=torch.int32) * dummy_blocks_per_seq
-            fi_buf["indices"][:dummy_pages] = torch.arange(dummy_pages, dtype=torch.int32) % num_kvcache_blocks
+            # Dummy FlashInfer inputs: each seq has max_num_blocks pages
+            dummy_pages = bs * max_num_blocks
+            fi_buf["indptr"][:] = torch.arange(0, bs + 1, dtype=torch.int32) * max_num_blocks
+            fi_buf["indices"][:dummy_pages] = torch.arange(dummy_pages, dtype=torch.int32)
             fi_buf["last_page_len"][:] = self.block_size
 
             # Set this bucket's wrapper on all attention modules, then warmup
