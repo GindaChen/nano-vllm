@@ -107,11 +107,28 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+        # Test if FlashInfer FP8 actually works end-to-end (needs nvcc for JIT at runtime)
+        fi_fp8_ok = False
         try:
-            import flashinfer  # noqa: F401
+            import flashinfer as _fi
+            _ws = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device='cuda')
+            _w = _fi.BatchDecodeWithPagedKVCacheWrapper(_ws, "NHD")
+            _ip = torch.arange(2, dtype=torch.int32, device='cuda')
+            _idx = torch.zeros(1, dtype=torch.int32, device='cuda')
+            _lpl = torch.full((1,), self.block_size, dtype=torch.int32, device='cuda')
+            _w.plan(_ip, _idx, _lpl,
+                    hf_config.num_attention_heads // self.world_size,
+                    num_kv_heads, head_dim, self.block_size,
+                    q_data_type=hf_config.torch_dtype,
+                    kv_data_type=torch.float8_e4m3fn)
+            fi_fp8_ok = True
+            print("FlashInfer FP8 check passed — using FP8 KV cache")
+        except Exception as e:
+            print(f"FlashInfer FP8 not available ({type(e).__name__}: {e}) — using BF16 KV cache")
+        if fi_fp8_ok:
             kv_dtype = torch.float8_e4m3fn
             kv_dtype_bytes = 1  # FP8 = 1 byte per element
-        except Exception:
+        else:
             kv_dtype = hf_config.torch_dtype
             kv_dtype_bytes = hf_config.torch_dtype.itemsize
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * kv_dtype_bytes
