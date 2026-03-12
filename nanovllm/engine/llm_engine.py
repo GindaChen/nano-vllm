@@ -60,12 +60,37 @@ class LLMEngine:
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
 
+    _MULTI_STEP_K = 8
+
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+        k = 1 if is_prefill else self._MULTI_STEP_K
+        if k > 1:
+            bm = self.scheduler.block_manager
+            block_size = bm.block_size
+            needed = sum(
+                1 for j in range(1, k) for seq in seqs
+                if (seq.num_tokens + j) % block_size == 1
+            )
+            if len(bm.free_block_ids) < needed + 16:
+                k = 1
+            else:
+                for j in range(1, k):
+                    for seq in seqs:
+                        if (seq.num_tokens + j) % block_size == 1:
+                            block_id = bm.free_block_ids[0]
+                            bm._allocate_block(block_id)
+                            seq.block_table.append(block_id)
+        all_token_ids = self.model_runner.call("run", seqs, is_prefill, k)
+        already_output = set()
+        outputs = []
+        for token_ids in all_token_ids:
+            self.scheduler.postprocess(seqs, token_ids)
+            for seq in seqs:
+                if seq.is_finished and seq.seq_id not in already_output:
+                    outputs.append((seq.seq_id, seq.completion_token_ids))
+                    already_output.add(seq.seq_id)
+        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -(k * len(seqs))
         return outputs, num_tokens
 
     def is_finished(self):
