@@ -79,5 +79,5 @@ class Attention(nn.Module):
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode — use FlashInfer
-            o = self.decode_wrapper.run(q, kv_cache)
+            o = self.decode_wrapper.run(q, kv_cache, sm_scale=self.scale)
         return o
