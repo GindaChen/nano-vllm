@@ -244,7 +244,7 @@ class ModelRunner:
                 self._fi_num_kv_heads,
                 self._fi_head_dim,
                 self.block_size,
-                q_data_type=self.config.hf_config.torch_dtype,
+                self.config.hf_config.torch_dtype,
             )
             graph.replay()
             return graph_vars["token_ids_out"][:bs]
@@ -325,8 +325,7 @@ class ModelRunner:
 
             wrapper.begin_forward(
                 fi_buf["indptr"], fi_buf["indices"][:dummy_pages], fi_buf["last_page_len"],
-                num_qo_heads, num_kv_heads, head_dim, self.block_size,
-                q_data_type=hf_config.torch_dtype,
+                num_qo_heads, num_kv_heads, head_dim, self.block_size, hf_config.torch_dtype,
             )
             set_context(False, slot_mapping=slot_mapping[:bs])
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
@@ -335,8 +334,7 @@ class ModelRunner:
             # Re-plan before capture (same dummy inputs)
             wrapper.begin_forward(
                 fi_buf["indptr"], fi_buf["indices"][:dummy_pages], fi_buf["last_page_len"],
-                num_qo_heads, num_kv_heads, head_dim, self.block_size,
-                q_data_type=hf_config.torch_dtype,
+                num_qo_heads, num_kv_heads, head_dim, self.block_size, hf_config.torch_dtype,
             )
             set_context(False, slot_mapping=slot_mapping[:bs])
             with torch.cuda.graph(graph, self.graph_pool):
