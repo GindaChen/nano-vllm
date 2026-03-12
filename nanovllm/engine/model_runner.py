@@ -10,6 +10,12 @@ from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
+try:
+    from flash_attn_3.flash_attn_interface import get_scheduler_metadata as _fa3_get_scheduler_metadata
+    _FA3_SM_AVAILABLE = True
+except (ImportError, AttributeError):
+    _FA3_SM_AVAILABLE = False
+
 
 class ModelRunner:
 
@@ -237,7 +243,11 @@ class ModelRunner:
         hf_config = config.hf_config
         max_bs = self.config.max_num_seqs
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        max_model_len = config.max_model_len
         block_size = self.block_size
+        num_heads_q = hf_config.num_attention_heads
+        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // num_heads_q)
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.full((max_bs,), -1, dtype=torch.int32)
@@ -250,6 +260,21 @@ class ModelRunner:
         self.graphs = {}
         self.graph_pool = None
 
+        def _compute_scheduler_metadata(bs):
+            """Compute FA3 scheduler_metadata inside CUDA graph (captures as GPU op)."""
+            if not _FA3_SM_AVAILABLE:
+                return None
+            try:
+                return _fa3_get_scheduler_metadata(
+                    bs, 1, max_model_len, num_heads_q, num_kv_heads, head_dim,
+                    cache_seqlens=context_lens[:bs],
+                    qkv_dtype=torch.float8_e4m3fn,
+                    page_size=block_size,
+                    causal=True, num_splits=1,
+                )
+            except Exception:
+                return None
+
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs],
@@ -260,6 +285,8 @@ class ModelRunner:
             page_idx = ((safe_ctx.long() - 1) // block_size).unsqueeze(1)
             torch.where(ctx > 0, block_tables[:bs].gather(1, page_idx).squeeze(1) * block_size + (safe_ctx - 1) % block_size, neg_ones[:bs], out=slot_mapping[:bs])
             positions[:bs].copy_((safe_ctx - 1).long())
+            sm = _compute_scheduler_metadata(bs)
+            get_context().scheduler_metadata = sm
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
             token_ids_out[:bs] = self.model.compute_logits(outputs[:bs]).argmax(-1)
             with torch.cuda.graph(graph, self.graph_pool):
@@ -268,6 +295,8 @@ class ModelRunner:
                 page_idx = ((safe_ctx.long() - 1) // block_size).unsqueeze(1)
                 torch.where(ctx > 0, block_tables[:bs].gather(1, page_idx).squeeze(1) * block_size + (safe_ctx - 1) % block_size, neg_ones[:bs], out=slot_mapping[:bs])
                 positions[:bs].copy_((safe_ctx - 1).long())
+                sm = _compute_scheduler_metadata(bs)
+                get_context().scheduler_metadata = sm
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
                 token_ids_out[:bs] = self.model.compute_logits(outputs[:bs]).argmax(-1)
             if self.graph_pool is None:

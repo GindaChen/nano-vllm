@@ -12,6 +12,7 @@ class Context:
     slot_mapping: torch.Tensor | None = None
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
+    scheduler_metadata: object = None
 
 _CONTEXT = Context()
 
