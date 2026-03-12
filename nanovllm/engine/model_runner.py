@@ -7,7 +7,6 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
-from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
@@ -30,7 +29,6 @@ class ModelRunner:
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
-        self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
@@ -185,13 +183,6 @@ class ModelRunner:
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
-    def prepare_sample(self, seqs: list[Sequence]):
-        temperatures = []
-        for seq in seqs:
-            temperatures.append(seq.temperature)
-        temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
-        return temperatures
-
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill:
@@ -223,11 +214,9 @@ class ModelRunner:
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         if is_prefill:
             input_ids, positions = self.prepare_prefill(seqs)
-            temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
             logits = self.run_model(input_ids, positions, is_prefill)
-            # logits shape: [num_seqs, vocab_size] — ParallelLMHead already extracts last-position tokens
             if self.rank == 0:
-                token_ids = self.sampler(logits, temperatures).tolist()
+                token_ids = logits.argmax(-1).tolist()
             else:
                 token_ids = None
         else:
