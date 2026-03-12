@@ -12,7 +12,7 @@ class SequenceStatus(Enum):
 
 
 class Sequence:
-    block_size = 256
+    block_size = 64
     counter = count()
 
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
