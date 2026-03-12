@@ -92,10 +92,15 @@ class BlockManager:
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+        if len(seq) % self.block_size != 1:
+            return True
+        needed = len(seq) // self.block_size + 1
+        return len(seq.block_table) >= needed or bool(self.free_block_ids)
 
     def may_append(self, seq: Sequence):
         if len(seq) % self.block_size == 1:
-            block_id = self.free_block_ids[0]
-            self._allocate_block(block_id)
-            seq.block_table.append(block_id)
+            needed = len(seq) // self.block_size + 1
+            if len(seq.block_table) < needed:
+                block_id = self.free_block_ids[0]
+                self._allocate_block(block_id)
+                seq.block_table.append(block_id)
