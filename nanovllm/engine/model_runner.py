@@ -107,10 +107,12 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
+        kv_dtype = torch.float8_e4m3fn
+        kv_dtype_bytes = 1  # FP8 = 1 byte per element
+        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * kv_dtype_bytes
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim, dtype=kv_dtype)
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
@@ -168,6 +170,9 @@ class ModelRunner:
         slot_mapping = []
         context_lens = []
         temperatures = [] if self.rank == 0 else None
+        fi_indptr = [0]
+        fi_indices = []
+        fi_lpl = []
         bs = self.block_size
         for seq in seqs:
             n = seq.num_tokens
@@ -178,6 +183,9 @@ class ModelRunner:
             slot_mapping.append(bt[-1] * bs + (n - 1) % bs)
             if temperatures is not None:
                 temperatures.append(seq.temperature)
+            fi_indptr.append(fi_indptr[-1] + len(bt))
+            fi_indices.extend(bt)
+            fi_lpl.append((n - 1) % bs + 1)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -186,6 +194,11 @@ class ModelRunner:
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         if temperatures is not None:
             temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+        # store FlashInfer metadata for run_model
+        self._fi_actual_bs = len(seqs)
+        self._fi_indptr = fi_indptr
+        self._fi_indices = fi_indices
+        self._fi_lpl = fi_lpl
         return input_ids, positions, temperatures
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -204,7 +217,8 @@ class ModelRunner:
         else:
             bs = input_ids.size(0)
             context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            bucket_bs = next(x for x in self.graph_bs if x >= bs)
+            graph = self.graphs[bucket_bs]
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
@@ -219,6 +233,30 @@ class ModelRunner:
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            # FlashInfer plan: update per-bucket metadata buffers before replay
+            if getattr(self, '_use_flashinfer', False) and bucket_bs in self.fi_wrappers:
+                fi_wrapper, fi_indptr_buf, fi_indices_buf, fi_lpl_buf = self.fi_wrappers[bucket_bs]
+                actual_bs = self._fi_actual_bs
+                fi_indptr = self._fi_indptr
+                fi_indices = self._fi_indices
+                fi_lpl = self._fi_lpl
+                # Pad to bucket_bs with 1-page dummy sequences (pointing to page 0)
+                total_pages = fi_indptr[-1]
+                padding = bucket_bs - actual_bs
+                if padding > 0:
+                    fi_indptr = fi_indptr + [total_pages + i + 1 for i in range(padding)]
+                    fi_indices = fi_indices + [0] * padding
+                    fi_lpl = fi_lpl + [1] * padding
+                indptr_t = torch.tensor(fi_indptr, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+                indices_t = torch.tensor(fi_indices, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+                lpl_t = torch.tensor(fi_lpl, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+                hf_config = self.config.hf_config
+                fi_wrapper.plan(
+                    indptr_t, indices_t, lpl_t,
+                    self.fi_num_qo_heads, self.fi_num_kv_heads, self.fi_head_dim,
+                    self.block_size, q_data_type=hf_config.torch_dtype,
+                    kv_data_type=torch.float8_e4m3fn,
+                )
             graph.replay()
             return graph_vars["token_ids_out"][:bs]
 
@@ -256,11 +294,60 @@ class ModelRunner:
         self.graphs = {}
         self.graph_pool = None
 
+        # Initialize FlashInfer wrappers for FP8 paged decode
+        try:
+            import flashinfer as fi
+            num_qo_heads = hf_config.num_attention_heads // self.world_size
+            num_kv_heads = hf_config.num_key_value_heads // self.world_size
+            head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+            self.fi_workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device='cuda')
+            self.fi_wrappers = {}
+            self.fi_num_qo_heads = num_qo_heads
+            self.fi_num_kv_heads = num_kv_heads
+            self.fi_head_dim = head_dim
+            use_flashinfer = True
+        except Exception:
+            use_flashinfer = False
+
         for bs in reversed(self.graph_bs):
+            fi_wrapper = None
+            if use_flashinfer:
+                fi_indptr_buf = torch.zeros(bs + 1, dtype=torch.int32, device='cuda')
+                fi_indices_buf = torch.zeros(bs * max_num_blocks, dtype=torch.int32, device='cuda')
+                fi_lpl_buf = torch.ones(bs, dtype=torch.int32, device='cuda')
+                try:
+                    fi_wrapper = fi.BatchDecodeWithPagedKVCacheWrapper(
+                        self.fi_workspace, "NHD", use_cuda_graph=True,
+                        paged_kv_indptr_buffer=fi_indptr_buf,
+                        paged_kv_indices_buffer=fi_indices_buf,
+                        paged_kv_last_page_len_buffer=fi_lpl_buf,
+                    )
+                    dummy_indptr = torch.arange(bs + 1, dtype=torch.int32, device='cuda')
+                    dummy_indices = torch.zeros(bs, dtype=torch.int32, device='cuda')
+                    dummy_lpl = torch.full((bs,), self.block_size, dtype=torch.int32, device='cuda')
+                    fi_wrapper.plan(
+                        dummy_indptr, dummy_indices, dummy_lpl,
+                        num_qo_heads, num_kv_heads, head_dim, self.block_size,
+                        q_data_type=hf_config.torch_dtype,
+                        kv_data_type=torch.float8_e4m3fn,
+                    )
+                    self.fi_wrappers[bs] = (fi_wrapper, fi_indptr_buf, fi_indices_buf, fi_lpl_buf)
+                except Exception as e:
+                    print(f"FlashInfer wrapper init failed for bs={bs}: {e}")
+                    fi_wrapper = None
+                    use_flashinfer = False
+
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs],
+                        block_tables=block_tables[:bs], flashinfer_decode_wrapper=fi_wrapper)
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
             token_ids_out[:bs] = self.model.compute_logits(outputs[:bs]).argmax(-1)
+            if fi_wrapper is not None:
+                fi_wrapper.plan(
+                    dummy_indptr, dummy_indices, dummy_lpl,
+                    num_qo_heads, num_kv_heads, head_dim, self.block_size,
+                    q_data_type=hf_config.torch_dtype, kv_data_type=torch.float8_e4m3fn,
+                )
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
                 token_ids_out[:bs] = self.model.compute_logits(outputs[:bs]).argmax(-1)
@@ -279,3 +366,4 @@ class ModelRunner:
             outputs=outputs,
             token_ids_out=token_ids_out,
         )
+        self._use_flashinfer = use_flashinfer and bool(self.fi_wrappers)
