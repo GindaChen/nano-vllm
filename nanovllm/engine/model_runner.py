@@ -36,7 +36,6 @@ class ModelRunner:
         self._prev_decode_bs = 0
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
-        self._init_decode_buffers()
 
         if self.world_size > 1:
             if rank == 0:
@@ -119,16 +118,6 @@ class ModelRunner:
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
 
-    def _init_decode_buffers(self):
-        """Pre-allocate pinned CPU tensors at max_bs to avoid cudaMallocHost cache misses per step."""
-        max_bs = self.config.max_num_seqs
-        max_num_blocks = (self.config.max_model_len + self.block_size - 1) // self.block_size
-        self._pd_input_ids = torch.empty(max_bs, dtype=torch.int64).pin_memory()
-        self._pd_positions = torch.empty(max_bs, dtype=torch.int64).pin_memory()
-        self._pd_slot_mapping = torch.empty(max_bs, dtype=torch.int32).pin_memory()
-        self._pd_context_lens = torch.empty(max_bs, dtype=torch.int32).pin_memory()
-        self._pd_block_tables = torch.empty(max_bs, max_num_blocks, dtype=torch.int32).pin_memory()
-
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
@@ -174,43 +163,25 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
-        n_seqs = len(seqs)
-        block_size = self.block_size
         input_ids = []
         positions = []
         slot_mapping = []
         context_lens = []
-        max_bt_len = 0
+        bs = self.block_size
         for seq in seqs:
             n = seq.num_tokens
             bt = seq.block_table
             input_ids.append(seq.last_token)
             positions.append(n - 1)
             context_lens.append(n)
-            slot_mapping.append(bt[-1] * block_size + (n - 1) % block_size)
-            bt_len = len(bt)
-            if bt_len > max_bt_len:
-                max_bt_len = bt_len
-        # Copy into pre-allocated pinned buffers (avoids cudaMallocHost per step)
-        self._pd_input_ids[:n_seqs].copy_(torch.tensor(input_ids, dtype=torch.int64))
-        self._pd_positions[:n_seqs].copy_(torch.tensor(positions, dtype=torch.int64))
-        self._pd_slot_mapping[:n_seqs].copy_(torch.tensor(slot_mapping, dtype=torch.int32))
-        self._pd_context_lens[:n_seqs].copy_(torch.tensor(context_lens, dtype=torch.int32))
-        flat_bt = []
-        for seq in seqs:
-            bt = seq.block_table
-            flat_bt.extend(bt)
-            flat_bt.extend((-1,) * (max_bt_len - len(bt)))
-        self._pd_block_tables[:n_seqs, :max_bt_len].copy_(
-            torch.tensor(flat_bt, dtype=torch.int32).view(n_seqs, max_bt_len)
-        )
-        input_ids_gpu = self._pd_input_ids[:n_seqs].cuda(non_blocking=True)
-        positions_gpu = self._pd_positions[:n_seqs].cuda(non_blocking=True)
-        slot_mapping_gpu = self._pd_slot_mapping[:n_seqs].cuda(non_blocking=True)
-        context_lens_gpu = self._pd_context_lens[:n_seqs].cuda(non_blocking=True)
-        block_tables_gpu = self._pd_block_tables[:n_seqs, :max_bt_len].cuda(non_blocking=True)
-        set_context(False, slot_mapping=slot_mapping_gpu, context_lens=context_lens_gpu, block_tables=block_tables_gpu)
-        return input_ids_gpu, positions_gpu
+            slot_mapping.append(bt[-1] * bs + (n - 1) % bs)
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables(seqs)
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        return input_ids, positions
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
